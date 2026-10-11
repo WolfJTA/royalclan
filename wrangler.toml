@@ -2,6 +2,11 @@ name = "royalclan"
 main = "src/worker.js"
 compatibility_date = "2026-10-01"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "royal"
+database_id = "e0f6a3b2-8b6f-4321-ae6c-bb85d1dbb95d"
+
 [[kv_namespaces]]
 binding = "royalclan"
 id = "8f7ecf2f590c4b57a8fa4519d174a498"
