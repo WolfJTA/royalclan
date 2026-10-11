@@ -2,7 +2,7 @@
  * Wolf Clan — Cloudflare Worker
  *
  * Serves the static site AND acts as the API/data layer:
- *  - Owner login (password stored in KV, checked here, never shipped to the client)
+ *  - Owner login (password stored in D1, checked here, never shipped to the client)
  *  - Signed session cookie (HMAC-SHA256) for the owner
  *  - Add/remove clan members (owner only)
  *  - Start/stop "recording" mode (owner only)
@@ -10,16 +10,24 @@
  *    triggered by incoming requests rather than a cron trigger)
  *  - Serve current stats (kills or recording-mode deltas) to everyone
  *
- * KV namespace binding expected: env.wolfclan
+ * The frontend only calls /api/stats on page load and right after an owner
+ * action (add/remove member, start/stop recording) — there is no background
+ * auto-refresh, so visitors reload the page to see newer numbers. The
+ * server-side ~60s poll throttle above still protects the ArchMC API from
+ * being hit too often when many people load the page close together.
  *
- * KV keys used:
- *   password          -> plaintext owner password (never sent to client)
- *   session_secret     -> random secret used to HMAC-sign session cookies
- *   members             -> JSON array of ArchMC usernames, e.g. ["WolfJTA","Foo"]
- *   recording            -> "1" if recording mode is active, absent/other otherwise
- *   recording_start        -> JSON map { username: killsAtRecordingStart }
- *   kills:<username>          -> latest cached total lifesteal kills for that user
- *   last_poll                   -> ms timestamp of the last upstream poll
+ * D1 database binding expected: env.DB
+ *
+ * Schema (see schema.sql):
+ *   kv(key TEXT PRIMARY KEY, value TEXT)
+ *     - password          -> plaintext owner password (never sent to client)
+ *     - session_secret     -> random secret used to HMAC-sign session cookies
+ *     - members             -> JSON array of ArchMC usernames, e.g. ["WolfJTA","Foo"]
+ *     - recording            -> "1" if recording mode is active, absent/other otherwise
+ *     - recording_start        -> JSON map { username: killsAtRecordingStart }
+ *     - last_poll                -> ms timestamp of the last upstream poll
+ *   kills(username TEXT PRIMARY KEY, total INTEGER)
+ *     - latest cached total lifesteal kills per member
  */
 
 const POLL_INTERVAL_MS = 60_000;
@@ -46,6 +54,27 @@ function json(data, init = {}) {
 
 function badRequest(msg, status = 400) {
   return json({ error: msg }, { status });
+}
+
+// ---------- D1 key-value helpers ----------
+// Thin wrapper over a simple `kv(key, value)` table so the rest of the
+// code can keep using get/put/delete the same way it did with KV.
+
+async function kvGet(env, key) {
+  const row = await env.DB.prepare("SELECT value FROM kv WHERE key = ?").bind(key).first();
+  return row ? row.value : null;
+}
+
+async function kvPut(env, key, value) {
+  await env.DB.prepare(
+    "INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  )
+    .bind(key, value)
+    .run();
+}
+
+async function kvDelete(env, key) {
+  await env.DB.prepare("DELETE FROM kv WHERE key = ?").bind(key).run();
 }
 
 function getCookie(request, name) {
@@ -115,10 +144,10 @@ function randomSecret() {
 }
 
 async function getOrCreateSessionSecret(env) {
-  let secret = await env.wolfclan.get("session_secret");
+  let secret = await kvGet(env, "session_secret");
   if (!secret) {
     secret = randomSecret();
-    await env.wolfclan.put("session_secret", secret);
+    await kvPut(env, "session_secret", secret);
   }
   return secret;
 }
@@ -131,7 +160,7 @@ async function isOwner(request, env) {
 }
 
 async function getMembers(env) {
-  const raw = await env.wolfclan.get("members");
+  const raw = await kvGet(env, "members");
   if (!raw) return [];
   try {
     const arr = JSON.parse(raw);
@@ -142,11 +171,11 @@ async function getMembers(env) {
 }
 
 async function setMembers(env, members) {
-  await env.wolfclan.put("members", JSON.stringify(members));
+  await kvPut(env, "members", JSON.stringify(members));
 }
 
 async function isRecording(env) {
-  const v = await env.wolfclan.get("recording");
+  const v = await kvGet(env, "recording");
   return v === "1";
 }
 
@@ -169,12 +198,12 @@ async function fetchLifestealKills(username) {
 }
 
 /**
- * Poll every member's current total kills from ArchMC and cache them in KV.
+ * Poll every member's current total kills from ArchMC and cache them in D1.
  * Throttled: only actually hits the upstream API if POLL_INTERVAL_MS has
  * elapsed since the last poll. Safe to call on every incoming request.
  */
 async function maybePoll(env) {
-  const lastPollRaw = await env.wolfclan.get("last_poll");
+  const lastPollRaw = await kvGet(env, "last_poll");
   const lastPoll = lastPollRaw ? Number(lastPollRaw) : 0;
   const now = Date.now();
   if (now - lastPoll < POLL_INTERVAL_MS) {
@@ -183,7 +212,7 @@ async function maybePoll(env) {
 
   // Claim this poll slot immediately to reduce duplicate polls from
   // concurrent requests racing each other.
-  await env.wolfclan.put("last_poll", String(now));
+  await kvPut(env, "last_poll", String(now));
 
   const members = await getMembers(env);
   if (members.length === 0) return;
@@ -197,16 +226,30 @@ async function maybePoll(env) {
 
   for (const r of results) {
     if (r.status === "fulfilled") {
-      await env.wolfclan.put(`kills:${r.value.username}`, String(r.value.kills));
+      await setCachedKills(env, r.value.username, r.value.kills);
     }
     // On failure we just keep the last cached value for that member.
   }
 }
 
 async function getCachedKills(env, username) {
-  const raw = await env.wolfclan.get(`kills:${username}`);
-  const n = raw ? Number(raw) : 0;
+  const row = await env.DB.prepare("SELECT total FROM kills WHERE username = ?")
+    .bind(username)
+    .first();
+  const n = row ? Number(row.total) : 0;
   return Number.isFinite(n) ? n : 0;
+}
+
+async function setCachedKills(env, username, total) {
+  await env.DB.prepare(
+    "INSERT INTO kills (username, total) VALUES (?, ?) ON CONFLICT(username) DO UPDATE SET total = excluded.total"
+  )
+    .bind(username, total)
+    .run();
+}
+
+async function deleteCachedKills(env, username) {
+  await env.DB.prepare("DELETE FROM kills WHERE username = ?").bind(username).run();
 }
 
 async function buildStats(env) {
@@ -215,7 +258,7 @@ async function buildStats(env) {
 
   let recordingStart = {};
   if (recording) {
-    const raw = await env.wolfclan.get("recording_start");
+    const raw = await kvGet(env, "recording_start");
     try {
       recordingStart = raw ? JSON.parse(raw) : {};
     } catch {
@@ -264,7 +307,7 @@ async function handleApi(request, env, url) {
       return badRequest("Invalid JSON body");
     }
     const password = String(body.password ?? "");
-    const stored = await env.wolfclan.get("password");
+    const stored = await kvGet(env, "password");
     if (stored === null) {
       return badRequest("No password configured", 500);
     }
@@ -326,7 +369,7 @@ async function handleApi(request, env, url) {
     // Seed the cache immediately so the member appears right away.
     try {
       const kills = await fetchLifestealKills(username);
-      await env.wolfclan.put(`kills:${username}`, String(kills));
+      await setCachedKills(env, username, kills);
     } catch {
       /* ignore, will be picked up on next poll */
     }
@@ -345,7 +388,7 @@ async function handleApi(request, env, url) {
 
     const members = (await getMembers(env)).filter((m) => m !== username);
     await setMembers(env, members);
-    await env.wolfclan.delete(`kills:${username}`);
+    await deleteCachedKills(env, username);
     return json({ ok: true, members });
   }
 
@@ -356,17 +399,82 @@ async function handleApi(request, env, url) {
     for (const username of members) {
       snapshot[username] = await getCachedKills(env, username);
     }
-    await env.wolfclan.put("recording_start", JSON.stringify(snapshot));
-    await env.wolfclan.put("recording", "1");
+    await kvPut(env, "recording_start", JSON.stringify(snapshot));
+    await kvPut(env, "recording", "1");
     return json({ ok: true });
   }
 
   if (path === "/api/recording/stop" && request.method === "POST") {
-    await env.wolfclan.delete("recording");
+    await kvDelete(env, "recording");
     return json({ ok: true });
   }
 
+  if (path === "/api/migrate-kv" && request.method === "POST") {
+    return migrateKvToD1(env);
+  }
+
   return badRequest("Not found", 404);
+}
+
+/**
+ * One-time migration: copy every key currently in the old KV namespace
+ * into D1. Requires the old KV binding (env.wolfclan) to still be present
+ * in wrangler.toml alongside the new D1 binding (env.DB) — add it back
+ * temporarily if you removed it, run this once, then remove it again.
+ *
+ * Scalar/JSON keys (password, session_secret, members, recording,
+ * recording_start, last_poll) go into the `kv` table as-is. Keys of the
+ * form "kills:<username>" go into the `kills` table, split into
+ * (username, total). Anything else encountered is reported but skipped.
+ * Safe to re-run: every write is an upsert.
+ */
+async function migrateKvToD1(env) {
+  if (!env.wolfclan) {
+    return badRequest(
+      "No KV binding found (env.wolfclan). Add the old [[kv_namespaces]] block back to wrangler.toml and redeploy before running this.",
+      400
+    );
+  }
+
+  const migratedKv = [];
+  const migratedKills = [];
+  const skipped = [];
+
+  let cursor;
+  do {
+    const page = await env.wolfclan.list({ cursor });
+    for (const { name: key } of page.keys) {
+      const value = await env.wolfclan.get(key);
+      if (value === null) continue;
+
+      if (key.startsWith("kills:")) {
+        const username = key.slice("kills:".length);
+        const total = Number(value);
+        if (!username || !Number.isFinite(total)) {
+          skipped.push(key);
+          continue;
+        }
+        await setCachedKills(env, username, total);
+        migratedKills.push({ username, total });
+      } else if (
+        ["password", "session_secret", "members", "recording", "recording_start", "last_poll"].includes(key)
+      ) {
+        await kvPut(env, key, value);
+        migratedKv.push(key);
+      } else {
+        skipped.push(key);
+      }
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+
+  return json({
+    ok: true,
+    migratedKv,
+    migratedKillsCount: migratedKills.length,
+    migratedKills,
+    skipped,
+  });
 }
 
 // ---------- static site ----------
@@ -786,7 +894,7 @@ const HTML_PAGE = String.raw`<!DOCTYPE html>
 
 <main>
   <h1 id="leaderboardTitle">Lifesteal Kills</h1>
-  <p class="subtitle" id="leaderboardSubtitle">Updated automatically from ArchMC. Refreshes roughly once a minute.</p>
+  <p class="subtitle" id="leaderboardSubtitle">Updated from ArchMC when the page loads. Reload to refresh.</p>
   <p class="clan-total" id="clanTotal"></p>
 
   <div class="panel">
@@ -820,7 +928,12 @@ const HTML_PAGE = String.raw`<!DOCTYPE html>
       <button id="addMemberBtn" class="btn-accent">Add</button>
     </div>
     <p class="small-note">Adding a member verifies the username against ArchMC first.</p>
-    <div class="modal-actions">
+
+    <div class="modal-actions" style="justify-content: space-between;">
+      <div>
+        <button id="migrateKvBtn">Migrate from KV</button>
+        <p id="migrateResult" class="small-note"></p>
+      </div>
       <button id="manageClose">Close</button>
     </div>
   </div>
@@ -858,6 +971,8 @@ const HTML_PAGE = String.raw`<!DOCTYPE html>
   const newMemberInput = el("newMemberInput");
   const addMemberBtn = el("addMemberBtn");
   const manageClose = el("manageClose");
+  const migrateKvBtn = el("migrateKvBtn");
+  const migrateResult = el("migrateResult");
 
   let isOwner = false;
   let isRecording = false;
@@ -893,7 +1008,7 @@ const HTML_PAGE = String.raw`<!DOCTYPE html>
     // Bar width is each member's share of the clan's combined total
     // (kills summed across all members), not just scaled to the top player.
     const clanTotal = rows.reduce((sum, r) => sum + r.kills, 0);
-    clanTotalEl.innerHTML = "Clan total: <strong>" + clanTotal + "</strong> kills across " + rows.length + " member" + (rows.length === 1 ? "" : "s");
+    clanTotalEl.innerHTML = "Clan total: <strong>" + clanTotal + "</strong> kills across " + rows.length + " member" + "refresh to update" + (rows.length === 1 ? "" : "s");
 
     rows.forEach((row, i) => {
       const wrap = document.createElement("div");
@@ -935,10 +1050,10 @@ const HTML_PAGE = String.raw`<!DOCTYPE html>
     statusPill.classList.toggle("recording", isRecording);
     statusLabel.textContent = isRecording ? "Recording" : "hhi if you see this :D";
     leaderboardTitle.textContent = isRecording ? "Kills leaderboard for CO-OWNER!" : "Total Lifesteal Kills";
-    panelHeading.textContent = isRecording ? "Standings — new kills since recording started" : "Standings — all-time";
+    panelHeading.textContent = isRecording ? "Standings" : "Standings — all-time";
     leaderboardSubtitle.textContent = isRecording
-      ? "Check your kills here, and on October 24, 6 PM Eastern time, The #1 new kills will get co owner for a month."
-      : "Refreshes roughly once a minute, or reload to refresh.";
+      ? "Check your kills here, and on October 17, 12 PM Eastern time, The #1 new kills will get co owner for a month."
+      : "Updated from ArchMC when the page loads. Reload to refresh.";
     recordBtn.textContent = isRecording ? "Stop Recording" : "Start Recording";
   }
 
@@ -1012,6 +1127,24 @@ const HTML_PAGE = String.raw`<!DOCTYPE html>
     openModal(manageModal);
   });
   manageClose.addEventListener("click", () => closeModal(manageModal));
+
+  migrateKvBtn.addEventListener("click", async () => {
+    migrateResult.textContent = "Migrating...";
+    migrateKvBtn.disabled = true;
+    try {
+      const data = await api("/api/migrate-kv", { method: "POST" });
+      migrateResult.textContent =
+        "Migrated " + data.migratedKv.length + " setting(s) and " +
+        data.migratedKillsCount + " member kill total(s)." +
+        (data.skipped.length ? " Skipped " + data.skipped.length + " unrecognized key(s)." : "");
+      await refreshStats();
+      await loadMembers();
+    } catch (e) {
+      migrateResult.textContent = "Migration failed: " + e.message;
+    } finally {
+      migrateKvBtn.disabled = false;
+    }
+  });
 
   async function loadMembers() {
     try {
@@ -1141,10 +1274,13 @@ const HTML_PAGE = String.raw`<!DOCTYPE html>
   applyTheme();
 
   // ---- Boot ----
+  // Stats are only fetched here, on initial page load, plus right after an
+  // owner action (add/remove member, start/stop recording) so the owner
+  // sees immediate feedback. No background polling — visitors need to
+  // reload the page to see newer numbers.
   (async function init() {
     await refreshSession();
     await refreshStats();
-    setInterval(refreshStats, 60 * 1000);
   })();
 })();
 </script>
